@@ -204,8 +204,7 @@ options:
   name:
     description:
       - Unique repository ID. This option builds the section name of the repository in the repo file.
-      - This parameter is only required if I(state) is set to C(present) or
-        C(absent).
+      - If given a COPR project like 'copr:user/project' it will install the COPR repo for the project
     required: true
   password:
     description:
@@ -313,6 +312,10 @@ options:
   username:
     description:
       - Username to use for basic authentication to a repo or really any url.
+  copr_api:
+    description:
+      - URL for COPR API
+    default: https://copr.fedorainfracloud.org
 
 extends_documentation_fragment:
   - files
@@ -371,6 +374,11 @@ EXAMPLES = '''
     name: epel
     file: external_repos
     state: absent
+
+- name: Install nasirhm/hello-world COPR repo
+  yum_repository:
+    name: copr:nasirhm/hello-world
+    state: present
 '''
 
 RETURN = '''
@@ -391,6 +399,9 @@ import os
 from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils.six.moves import configparser
 from ansible.module_utils._text import to_native
+from ansible.module_utils.six.moves.urllib.parse import urlparse
+from ansible.module_utils.urls import (fetch_url, generic_urlparse)
+from ansible.module_utils.common.sys_info import (get_distribution, get_distribution_version)
 
 
 class YumRepo(object):
@@ -548,6 +559,7 @@ def main():
     argument_spec = dict(
         bandwidth=dict(),
         baseurl=dict(type='list'),
+        copr_api=dict(default='https://copr.fedorainfracloud.org', type='str'),
         cost=dict(),
         deltarpm_metadata_percentage=dict(),
         deltarpm_percentage=dict(),
@@ -616,6 +628,37 @@ def main():
 
     name = module.params['name']
     state = module.params['state']
+
+    if name.startswith('copr:'):
+        copr_api = module.params['copr_api']
+        copr_user, copr_project = name.split(':')[1].strip().split('/')
+        copr_server = generic_urlparse(list(urlparse(copr_api)))['hostname']
+        distro = get_distribution().lower()
+        if distro in ['centos', 'rhel', 'redhat']:
+            distro = 'epel'
+        distro_version = get_distribution_version().lower()
+        copr_url = f'{copr_api}/coprs/{copr_user}/{copr_project}/repo/{distro}-{distro_version}/dnf.repo'
+        response, info = fetch_url(module, copr_url)
+        if info['status'] != 200:
+            module.fail_json(msg=f"failed to fetch COPR repo {copr_url}, error was: {info['msg']}")
+
+        copr_params = configparser.RawConfigParser()
+        copr_params.read_string(to_native(response.read()))
+        for key in copr_params[f"copr:{copr_server}:{copr_user}:{copr_project}"]:
+            module.params[key] = copr_params[f"copr:{copr_server}:{copr_user}:{copr_project}"][key]
+
+        module.params['name'] = f"copr:{copr_server}:{copr_user}:{copr_project}"
+        module.params['description'] = copr_params[f"copr:{copr_server}:{copr_user}:{copr_project}"]['name']
+        module.params['file'] = f"_copr:{copr_server}:{copr_user}:{copr_project}"
+        # its possible to have multiple entries for the baseurl and gpgkey but
+        # copr doesn't do this. this ansible module expects it to be a list so
+        # give it a list
+        for list_param in ['baseurl', 'gpgkey']:
+            try:
+                module.params[list_param] = [module.params[list_param]]
+            except KeyError:
+                pass
+
 
     # Check if required parameters are present
     if state == 'present':
